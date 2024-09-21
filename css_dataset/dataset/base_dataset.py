@@ -281,6 +281,7 @@ class BaseIncrement(Dataset):
     def __len__(self):
         return len(self.dataset)
 
+
     def update_stage(self, stage_number):
         max_stage = len(self.stage_index_dict.keys())
         labels_old = []

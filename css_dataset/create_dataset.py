@@ -14,6 +14,15 @@ def load_dataset_from_config(config, task_number, logger):
     return dataset_class
 
 
+def count_lines(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File {file_path} does not exist")
+
+    with open(file_path, 'r') as f:
+        lines = sum(1 for line in f)
+
+    return lines
+
 def create_task_dataset(config, task_number: int, logger):
     """创建选择任务的数据集"""
     task_number = "task_" + str(task_number)
@@ -37,12 +46,14 @@ def create_task_dataset(config, task_number: int, logger):
         dataset = split_dataset_class(**init_dict["split_config"])
         stage_path_dict = init_task_path_from_config(config, dataset, task_number)
     else:
+        #拿到每个stage的图像保存路径
         root_save_stage_image_list_path = config_path.joinpath("dataset", "saved_task_txt", config.name,task_number)
         stage_path_dict = {stage: str(root_save_stage_image_list_path.joinpath(str(stage) + ".txt")) for stage in
                             index_order.keys()}
     init_dict["stage_path_dict"] = stage_path_dict
     init_dict["stage_index_dict"] = index_order
     increment = increment_dataset_class(**init_dict)
+    increment.stage_len = {stage: count_lines(path) for stage, path in increment.stage_path_dict.items()}
     return increment
 
 
