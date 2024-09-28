@@ -1,16 +1,13 @@
 import os
 import numpy as np
 import torch
-import torchvision as tv
 from typing import Optional, List, Callable, Tuple
 from PIL import Image
-from css_dataset.dataset.register import dataset_entrypoints
+from .register import dataset_entrypoints
 from torch.utils.data import Dataset
-from typing_extensions import override
 from random import shuffle
-from torch import Tensor
 from css_dataset.model.utils.ImageList import ImageList
-
+from torchvision.transforms import ToTensor
 
 # 这里存放的是dataset的模板，继承这个模板实现相应的功能就可以了
 
@@ -22,10 +19,17 @@ class BaseSplit(Dataset):
                  target_transform: Optional[Callable] = None,
                  need_index_name: bool = True,
                  classes: Optional[dict] = None,
-                 ignore_index: Optional[List] = None,
-                 image_size: Tuple[int, int] = (800, 1330),
-                 mask_value: int = 255):
+                 ignore_index: Optional[List[int]] = None,
+                 image_size: Tuple[int, int] = (1024, 1024),
+                 mask_value: int = 255,
+                 pixel_mean: Optional[List[int]] = None,
+                 pixel_std: Optional[List[int]] = None,
+                 ):
 
+        if pixel_mean is None:
+            self.pixel_mean = [123.675, 116.28, 103.53]
+        if pixel_std is None:
+            self.pixel_std = [58.395, 57.12, 57.375]
         if ignore_index is None:
             # 一般target中255都是忽略的地方（黑色背景）
             self.ignore_index = [255]
@@ -74,7 +78,7 @@ class BaseSplit(Dataset):
 
         return process_image
 
-    def resize_image_aspect_ratio(self,img:Image)->Image:
+    def resize_image_aspect_ratio(self, img: Image, label: bool = True) -> Image:
         # 原始图片尺寸
         # wd
         min_size = (self.image_size[0], self.image_size[0])
@@ -101,26 +105,48 @@ class BaseSplit(Dataset):
             #     if new_height > max_size[1]: new_height = max_size[1]
 
         # resize 图片并保持原始纵横比
-        resized_img = img.resize((new_width, new_height), Image.BILINEAR)
-
+        if label:
+            resized_img = img.resize((new_width, new_height), Image.NEAREST)
+        else:
+            resized_img = img.resize((new_width, new_height), Image.BILINEAR)
         return resized_img
 
     def _init_image_transform(self) -> Callable:
-        new_image_size = self.image_size
+        """初始化变化中完成了以下操作：保持原图比例的情况下把原图的最大边拓展至image_size，其余地方填充0.并且使用ImageList类保存了图片和它的填充遮罩"""
+        target_image_size = self.image_size
+        img_std = torch.tensor(self.pixel_std)
+        img_std = img_std[:, None, None]
+        img_mean = torch.tensor(self.pixel_mean)
+        img_mean = img_mean[:, None, None]
 
-        def process_image(image: Image, new_image_size: Tuple[int, int] = new_image_size) -> ImageList:
-            new_image = self.resize_image_aspect_ratio(image)
-            new_image = torch.tensor(np.array(new_image))
-            if len(new_image.shape)!= 3:
+        def process_image(image: Image, new_image_size: Tuple[int, int] = target_image_size, std=None,
+                          mean=None) -> ImageList:
+            is_target_image = False
+            if std is None:
+                std = img_std
+            if mean is None:
+                mean = img_mean
+            if image.mode not in ["L"]:
+                new_image = self.resize_image_aspect_ratio(image, False)
+            else:
+                new_image = self.resize_image_aspect_ratio(image, True)
+            new_image = ToTensor()(new_image)
+            if len(new_image.shape) != 3:
                 new_image = new_image.unsqueeze(-1)
-            new_image = new_image.permute(2, 0, 1)
-
-            image_size = new_image.shape[-2:]
-            color_image_size = (3,*new_image_size)
+                image_size = new_image.shape[-2:]
+                color_image_size = (1, *new_image_size)
+                is_target_image = True
+            else:
+                image_size = new_image.shape[-2:]
+                color_image_size = (3, *new_image_size)
             resize_image = torch.zeros(color_image_size, dtype=torch.float)
-            resize_image[:, :image_size[0], :image_size[1]] = new_image
+            if not is_target_image:
+                resize_image[:, :image_size[0], :image_size[1]] = new_image
+            else:
+                resize_image[:, :image_size[0], :image_size[1]] = new_image
             mask = torch.ones(new_image_size, dtype=torch.bool)
             mask[:image_size[0], :image_size[1]] = False
+            mask = mask[None]
             image_list = ImageList(resize_image, mask, image_size)
             return image_list
 
@@ -128,7 +154,10 @@ class BaseSplit(Dataset):
 
     def _get_path(self):
         """这个类需要被重写，引导到储存文件图片路径的文档，默认是root_dir下list中train.txt"""
-        return os.path.join(self.root, "list", 'train.txt')
+        if self.train:
+            return os.path.join(self.root, "list", 'train.txt')
+        else:
+            return os.path.join(self.root, "list", 'val.txt')
 
     def _load_data_path_to_list(self, path):
         """如果这里的文件是一行中前面是相对于root_dir的image path，后面是target path，例如：JPEGImages/2007_000032.jpg，那么就不用重写"""
@@ -147,12 +176,15 @@ class BaseSplit(Dataset):
     def _get_text_prompt_from_target(self, target):
         """
         这里默认target中简单通过灰度值储存label，例如label序号是3则图片对应位置灰度值是3，如果是彩色target需要重写此方法
-        同时这里读取label默认读取全部label，如果有label对应空或者背景最好重写剔除
         """
         unique_values = np.unique(np.array(target).flatten())
         target_text = [self.classes[x] for x in unique_values if x not in self.ignore_index]
         text_prompt = ".".join(target_text)
         return text_prompt
+
+    def _get_label_number_from_target(self, target):
+        unique_values = np.unique(np.array(target).flatten())
+        return [i for i in unique_values if i not in self.ignore_index]
 
     def get_class_index(self):
         return [x for x in self.classes.keys() if x not in self.ignore_index]
@@ -162,15 +194,14 @@ class BaseSplit(Dataset):
             self.classes[i] = "ignore"
 
     def __getitem__(self, index):
-        single_batch = {}
-        single_batch['path'] = (self.images[index][0], self.images[index][1])
+        single_batch = {'path': (self.images[index][0], self.images[index][1])}
         image = Image.open(self.images[index][0]).convert('RGB')
         target = Image.open(self.images[index][1])
         if not self.is_filter:
-            self.name = self.need_index_name
-            if self.name:
+            if self.need_index_name:
                 text_prompt = self._get_text_prompt_from_target(target) + "."
-                single_batch["label_prompt"] = text_prompt
+                single_batch["text_prompt"] = text_prompt
+                single_batch["label_index"] = self._get_label_number_from_target(target)
             if self.target_transform is not None:
                 target = self.target_transform(target)
             if self.transform is not None:
@@ -231,7 +262,7 @@ class BaseIncrement(Dataset):
         self.dataset.target_transform = self._create_target_transform
         self.index = 0
         self.update_flag = False
-        self.class_name = [v for k,v in self.dataset.classes.items() if k in self.labels]
+        self.class_name = [v for k, v in self.dataset.classes.items() if k in self.labels]
 
     def __strip_ignore(self, labels):
         for i in self.ignore_index:
@@ -251,6 +282,8 @@ class BaseIncrement(Dataset):
                 tmp_labels = self.labels + [mask_value]
             elif self.data_masking == "current+old":
                 tmp_labels = self.labels + self.labels_old + [mask_value]
+            elif self.data_masking == "all":
+                tmp_labels = [a for a in self.dataset.classes.keys()] + [mask_value]
             else:
                 raise ValueError(f"masking type:{self.masking} not supported")
             mask = np.isin(image_array, tmp_labels)
@@ -261,26 +294,25 @@ class BaseIncrement(Dataset):
         return Image.fromarray(image_array)
 
     def __getitem__(self, index):
-        if index >= len(self.dataset.images):
-            index = index % len(self.dataset.images)
-            shuffle(self.dataset.images)
-        if self.update_flag:
-            self.update_flag = False
-            self.index = index
-            data = self.dataset[index - self.index]
-            text = data["label_prompt"].split(".")
-            text_prompt = [i for i in text if i in self.class_name]
-            data["text_prompt"] = text_prompt
-        else:
-            data = self.dataset[index]
-            text = data["label_prompt"].split(".")
-            text_prompt = [i for i in text if i in self.class_name]
-            data["text_prompt"] = text_prompt
+        # if index >= len(self.dataset.images):
+        #     index = index % len(self.dataset.images)
+        #     shuffle(self.dataset.images)
+        # if self.update_flag:
+        #     self.update_flag = False
+        #     self.index = index
+        #     data = self.dataset[index - self.index]
+        #     text = data["text_prompt"].split(".")
+        #     text_prompt = [i for i in text if i in self.class_name]
+        #     data["text_prompt"] = text_prompt
+        # else:
+        data = self.dataset[index]
+        text = data["text_prompt"].split(".")
+        text_prompt = [i for i in text if i in self.class_name]
+        data["text_prompt"] = text_prompt
         return data
 
     def __len__(self):
         return len(self.dataset)
-
 
     def update_stage(self, stage_number):
         max_stage = len(self.stage_index_dict.keys())
@@ -303,25 +335,8 @@ class BaseIncrement(Dataset):
 
 
 class BaseEvaluate(BaseIncrement):
-    def __init__(self, no_stage_value=224, **kwargs):
-        self.no_stage_value = no_stage_value
+    def __init__(self, **kwargs):
+        if "split_config" in kwargs.keys():
+            kwargs["split_config"]["train"] = False
         super().__init__(**kwargs)
 
-    @override
-    def _create_target_transform(self, img):
-
-        mask_value = self.mask_value
-        image_array = np.array(img)
-        if self.masking:
-            if self.data_masking == "current":
-                tmp_labels = self.labels + [mask_value]
-            elif self.data_masking == "current+old":
-                tmp_labels = self.labels + self.labels_old + [mask_value]
-            else:
-                raise ValueError(f"masking type:{self.masking} not supported")
-            mask = np.isin(image_array, tmp_labels)
-            image_array[~mask] = mask_value
-        else:
-            mask = np.isin(image_array, self.order)
-            image_array[~mask] = mask_value
-        return image_array

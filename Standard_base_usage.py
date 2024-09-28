@@ -47,19 +47,16 @@ from ram import get_transform
 transform = get_transform(image_size=384)
 config = get_dataset_config("VOC")
 print(config)
-user_input = input('If you have already configured "config/dataset/saved_task_txt/.....", Input yes: ')
-if user_input.lower() == 'yes':
-    config.increment_setting.save_stage_image_path = "default"
-else:
-    print("Configuration not found. Reconfig")
-dataset = load_dataset_from_config(config,1,None)
+config.increment_setting.save_stage_image_path = "default"
+
+dataset, eval = load_dataset_from_config(config,1,None)
 dataset.dataset.transform=transform
 dataloader = Dataloader(dataset,batch_size=8)
 i=0
-for img,label,text_prompt,label_prompt in dataloader:
+for batch in dataloader:
     i+=1
-    print("text", text_prompt)
-    print("label", label_prompt)
+    print("text", batch["text_prompt"])
+    print("label", batch["label_index"])
     if i >= 5:
         print("Update")
         dataset.update_stage(1)
